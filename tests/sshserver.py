@@ -51,12 +51,24 @@ class Server(paramiko.ServerInterface):
             b'UWT10hcuO4Ks8=')
     good_pub_key = paramiko.RSAKey(data=decodebytes(data))
 
+    commands = [
+        b'$SHELL -ilc "locale charmap"',
+        b'$SHELL -ic "locale charmap"'
+    ]
     encodings = ['UTF-8', 'GBK', 'UTF-8\r\n', 'GBK\r\n']
 
-    def __init__(self):
+    def __init__(self, encodings=[]):
         self.shell_event = threading.Event()
         self.exec_event = threading.Event()
-        self.encoding = random.choice(self.encodings)
+        self.cmd_to_enc = self.get_cmd2enc(encodings)
+        self.password_verified = False
+        self.key_verified = False
+
+    def get_cmd2enc(self, encodings):
+        n = len(self.commands)
+        while len(encodings) < n:
+            encodings.append(random.choice(self.encodings))
+        return dict(zip(self.commands, encodings[0:n]))
 
     def check_channel_request(self, kind, chanid):
         if kind == 'session':
@@ -73,18 +85,58 @@ class Server(paramiko.ServerInterface):
         print('Auth attempt with username: {!r} & key: {!r}'.format(username, u(hexlify(key.get_fingerprint())))) # noqa
         if (username in ['robey', 'keyonly']) and (key == self.good_pub_key):
             return paramiko.AUTH_SUCCESSFUL
+        if username == 'pkey2fa' and key == self.good_pub_key:
+            self.key_verified = True
+            return paramiko.AUTH_PARTIALLY_SUCCESSFUL
         return paramiko.AUTH_FAILED
+
+    def check_auth_interactive(self, username, submethods):
+        if username in ['pass2fa', 'pkey2fa']:
+            self.username = username
+            prompt = 'Verification code: ' if self.password_verified else 'Password: '  # noqa
+            print(username, prompt)
+            return paramiko.InteractiveQuery('', '', prompt)
+        return paramiko.AUTH_FAILED
+
+    def check_auth_interactive_response(self, responses):
+        if self.username in ['pass2fa', 'pkey2fa']:
+            if not self.password_verified:
+                if responses[0] == 'password':
+                    print('password verified')
+                    self.password_verified = True
+                    if self.username == 'pkey2fa':
+                        return self.check_auth_interactive(self.username, '')
+                else:
+                    print('wrong password: {}'.format(responses[0]))
+                    return paramiko.AUTH_FAILED
+            else:
+                if responses[0] == 'passcode':
+                    print('totp verified')
+                    return paramiko.AUTH_SUCCESSFUL
+                else:
+                    print('wrong totp: {}'.format(responses[0]))
+                    return paramiko.AUTH_FAILED
+        else:
+            return paramiko.AUTH_FAILED
 
     def get_allowed_auths(self, username):
         if username == 'keyonly':
             return 'publickey'
+        if username == 'pass2fa':
+            return 'keyboard-interactive'
+        if username == 'pkey2fa':
+            if not self.key_verified:
+                return 'publickey'
+            else:
+                return 'keyboard-interactive'
         return 'password,publickey'
 
     def check_channel_exec_request(self, channel, command):
-        if command != b'locale charmap':
+        if command not in self.commands:
             ret = False
         else:
             ret = True
+            self.encoding = self.cmd_to_enc[command]
             channel.send(self.encoding)
             channel.shutdown(1)
         self.exec_event.set()
@@ -104,7 +156,7 @@ class Server(paramiko.ServerInterface):
         return True
 
 
-def run_ssh_server(port=2200, running=True):
+def run_ssh_server(port=2200, running=True, encodings=[]):
     # now connect
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -118,7 +170,7 @@ def run_ssh_server(port=2200, running=True):
         t = paramiko.Transport(client)
         t.load_server_moduli()
         t.add_server_key(host_key)
-        server = Server()
+        server = Server(encodings)
         try:
             t.start_server(server=server)
         except Exception as e:
@@ -146,7 +198,12 @@ def run_ssh_server(port=2200, running=True):
 
         # chan.send('\r\n\r\nWelcome!\r\n\r\n')
         print(server.encoding)
-        chan.send(banner.encode(server.encoding.strip()))
+        try:
+            banner_encoded = banner.encode(server.encoding)
+        except (ValueError, LookupError):
+            continue
+
+        chan.send(banner_encoded)
         if username == 'bar':
             msg = chan.recv(1024)
             chan.send(msg)

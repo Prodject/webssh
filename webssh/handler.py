@@ -14,7 +14,8 @@ from tornado.options import options
 from tornado.process import cpu_count
 from webssh.utils import (
     is_valid_ip_address, is_valid_port, is_valid_hostname, to_bytes, to_str,
-    to_int, to_ip_address, UnicodeType, is_ip_hostname, is_same_primary_domain
+    to_int, to_ip_address, UnicodeType, is_ip_hostname, is_same_primary_domain,
+    is_valid_encoding
 )
 from webssh.worker import Worker, recycle_worker, clients
 
@@ -30,7 +31,6 @@ except ImportError:
 
 
 DELAY = 3
-KEY_MAX_SIZE = 16384
 DEFAULT_PORT = 22
 
 swallow_http_errors = True
@@ -39,6 +39,149 @@ redirecting = None
 
 class InvalidValueError(Exception):
     pass
+
+
+class SSHClient(paramiko.SSHClient):
+
+    def handler(self, title, instructions, prompt_list):
+        answers = []
+        for prompt_, _ in prompt_list:
+            prompt = prompt_.strip().lower()
+            if prompt.startswith('password'):
+                answers.append(self.password)
+            elif prompt.startswith('verification'):
+                answers.append(self.totp)
+            else:
+                raise ValueError('Unknown prompt: {}'.format(prompt_))
+        return answers
+
+    def auth_interactive(self, username, handler):
+        if not self.totp:
+            raise ValueError('Need a verification code for 2fa.')
+        self._transport.auth_interactive(username, handler)
+
+    def _auth(self, username, password, pkey, *args):
+        self.password = password
+        saved_exception = None
+        two_factor = False
+        allowed_types = set()
+        two_factor_types = {'keyboard-interactive', 'password'}
+
+        if pkey is not None:
+            logging.info('Trying publickey authentication')
+            try:
+                allowed_types = set(
+                    self._transport.auth_publickey(username, pkey)
+                )
+                two_factor = allowed_types & two_factor_types
+                if not two_factor:
+                    return
+            except paramiko.SSHException as e:
+                saved_exception = e
+
+        if two_factor:
+            logging.info('Trying publickey 2fa')
+            return self.auth_interactive(username, self.handler)
+
+        if password is not None:
+            logging.info('Trying password authentication')
+            try:
+                self._transport.auth_password(username, password)
+                return
+            except paramiko.SSHException as e:
+                saved_exception = e
+                allowed_types = set(getattr(e, 'allowed_types', []))
+                two_factor = allowed_types & two_factor_types
+
+        if two_factor:
+            logging.info('Trying password 2fa')
+            return self.auth_interactive(username, self.handler)
+
+        assert saved_exception is not None
+        raise saved_exception
+
+
+class PrivateKey(object):
+
+    max_length = 16384  # rough number
+
+    tag_to_name = {
+        'RSA': 'RSA',
+        'DSA': 'DSS',
+        'EC': 'ECDSA',
+        'OPENSSH': 'Ed25519'
+    }
+
+    def __init__(self, privatekey, password=None, filename=''):
+        self.privatekey = privatekey
+        self.filename = filename
+        self.password = password
+        self.check_length()
+        self.iostr = io.StringIO(privatekey)
+        self.last_exception = None
+
+    def check_length(self):
+        if len(self.privatekey) > self.max_length:
+            raise InvalidValueError('Invalid key length.')
+
+    def parse_name(self, iostr, tag_to_name):
+        name = None
+        for line_ in iostr:
+            line = line_.strip()
+            if line and line.startswith('-----BEGIN ') and \
+                    line.endswith(' PRIVATE KEY-----'):
+                lst = line.split(' ')
+                if len(lst) == 4:
+                    tag = lst[1]
+                    if tag:
+                        name = tag_to_name.get(tag)
+                        if name:
+                            break
+        return name, len(line_)
+
+    def get_specific_pkey(self, name, offset, password):
+        self.iostr.seek(offset)
+        logging.debug('Reset offset to {}.'.format(offset))
+
+        logging.debug('Try parsing it as {} type key'.format(name))
+        pkeycls = getattr(paramiko, name+'Key')
+        pkey = None
+
+        try:
+            pkey = pkeycls.from_private_key(self.iostr, password=password)
+        except paramiko.PasswordRequiredException:
+            raise InvalidValueError('Need a passphrase to decrypt the key.')
+        except (paramiko.SSHException, ValueError) as exc:
+            self.last_exception = exc
+            logging.debug(str(exc))
+
+        return pkey
+
+    def get_pkey_obj(self):
+        logging.info('Parsing private key {!r}'.format(self.filename))
+        name, length = self.parse_name(self.iostr, self.tag_to_name)
+        if not name:
+            raise InvalidValueError('Invalid key {}.'.format(self.filename))
+
+        offset = self.iostr.tell() - length
+        password = to_bytes(self.password) if self.password else None
+        pkey = self.get_specific_pkey(name, offset, password)
+
+        if pkey is None and name == 'Ed25519':
+            for name in ['RSA', 'ECDSA', 'DSS']:
+                pkey = self.get_specific_pkey(name, offset, password)
+                if pkey:
+                    break
+
+        if pkey:
+            return pkey
+
+        logging.error(str(self.last_exception))
+        msg = 'Invalid key'
+        if self.password:
+            msg += ' or wrong passphrase "{}" for decrypting it.'.format(
+                    self.password)
+        raise InvalidValueError(msg)
 
 
 class MixinHandler(object):
@@ -133,11 +276,14 @@ class MixinHandler(object):
             raise InvalidValueError('Missing value {}'.format(name))
         return value
 
+    def get_context_addr(self):
+        return self.context.address[:2]
+
     def get_client_addr(self):
         if options.xheaders:
-            return self.get_real_client_addr() or self.context.address
+            return self.get_real_client_addr() or self.get_context_addr()
         else:
-            return self.context.address
+            return self.get_context_addr()
 
     def get_real_client_addr(self):
         ip = self.request.remote_ip
@@ -176,7 +322,6 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         self.policy = policy
         self.host_keys_settings = host_keys_settings
         self.ssh_client = self.get_ssh_client()
-        self.privatekey_filename = None
         self.debug = self.settings.get('debug', False)
         self.result = dict(id=None, status=None, encoding=None)
 
@@ -194,7 +339,7 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
             super(IndexHandler, self).write_error(status_code, **kwargs)
 
     def get_ssh_client(self):
-        ssh = paramiko.SSHClient()
+        ssh = SSHClient()
         ssh._system_host_keys = self.host_keys_settings['system_host_keys']
         ssh._host_keys = self.host_keys_settings['host_keys']
         ssh._host_keys_filename = self.host_keys_settings['host_keys_filename']
@@ -206,51 +351,15 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         lst = self.request.files.get(name)
         if lst:
             # multipart form
-            self.privatekey_filename = lst[0]['filename']
+            filename = lst[0]['filename']
             data = lst[0]['body']
             value = self.decode_argument(data, name=name).strip()
         else:
             # urlencoded form
             value = self.get_argument(name, u'')
+            filename = ''
 
-        if len(value) > KEY_MAX_SIZE:
-            raise InvalidValueError(
-                'Invalid private key: {}'.format(self.privatekey_filename)
-            )
-        return value
-
-    @classmethod
-    def get_specific_pkey(cls, pkeycls, privatekey, password):
-        logging.info('Trying {}'.format(pkeycls.__name__))
-        try:
-            pkey = pkeycls.from_private_key(io.StringIO(privatekey),
-                                            password=password)
-        except paramiko.PasswordRequiredException:
-            raise
-        except paramiko.SSHException:
-            pass
-        else:
-            return pkey
-
-    @classmethod
-    def get_pkey_obj(cls, privatekey, password, filename):
-        bpass = to_bytes(password) if password else None
-
-        pkey = cls.get_specific_pkey(paramiko.RSAKey, privatekey, bpass)\
-            or cls.get_specific_pkey(paramiko.DSSKey, privatekey, bpass)\
-            or cls.get_specific_pkey(paramiko.ECDSAKey, privatekey, bpass)\
-            or cls.get_specific_pkey(paramiko.Ed25519Key, privatekey, bpass)
-
-        if not pkey:
-            if not password:
-                error = 'Invalid private key: {}'.format(filename)
-            else:
-                error = (
-                    'Wrong password {!r} for decrypting the private key.'
-                ) .format(password)
-            raise InvalidValueError(error)
-
-        return pkey
+        return value, filename
 
     def get_hostname(self):
         value = self.get_value('hostname')
@@ -281,31 +390,51 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
     def get_args(self):
         hostname = self.get_hostname()
         port = self.get_port()
-        if isinstance(self.policy, paramiko.RejectPolicy):
-            self.lookup_hostname(hostname, port)
         username = self.get_value('username')
         password = self.get_argument('password', u'')
-        privatekey = self.get_privatekey()
+        privatekey, filename = self.get_privatekey()
+        passphrase = self.get_argument('passphrase', u'')
+        totp = self.get_argument('totp', u'')
+
+        if isinstance(self.policy, paramiko.RejectPolicy):
+            self.lookup_hostname(hostname, port)
+
         if privatekey:
-            pkey = self.get_pkey_obj(
-                privatekey, password, self.privatekey_filename
-            )
-            password = None
+            pkey = PrivateKey(privatekey, passphrase, filename).get_pkey_obj()
         else:
             pkey = None
+
+        self.ssh_client.totp = totp
         args = (hostname, port, username, password, pkey)
         logging.debug(args)
+
         return args
 
-    def get_default_encoding(self, ssh):
+    def parse_encoding(self, data):
         try:
-            _, stdout, _ = ssh.exec_command('locale charmap')
-        except paramiko.SSHException:
-            result = None
-        else:
-            result = to_str(stdout.read().strip())
+            encoding = to_str(data.strip(), 'ascii')
+        except UnicodeDecodeError:
+            return
 
-        return result if result else 'utf-8'
+        if is_valid_encoding(encoding):
+            return encoding
+
+    def get_default_encoding(self, ssh):
+        commands = [
+            '$SHELL -ilc "locale charmap"',
+            '$SHELL -ic "locale charmap"'
+        ]
+
+        for command in commands:
+            _, stdout, _ = ssh.exec_command(command, get_pty=True)
+            data = stdout.read()
+            logging.debug('{!r} => {!r}'.format(command, data))
+            result = self.parse_encoding(data)
+            if result:
+                return result
+
+        logging.warn('Could not detect the default ecnoding.')
+        return 'utf-8'
 
     def ssh_connect(self, args):
         ssh = self.ssh_client
@@ -323,9 +452,10 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         except paramiko.BadHostKeyException:
             raise ValueError('Bad host key.')
 
-        chan = ssh.invoke_shell(term='xterm')
+        term = self.get_argument('term', u'') or u'xterm'
+        chan = ssh.invoke_shell(term=term)
         chan.setblocking(0)
-        worker = Worker(self.loop, ssh, chan, dst_addr, self.src_addr)
+        worker = Worker(self.loop, ssh, chan, dst_addr)
         worker.encoding = self.get_default_encoding(ssh)
         return worker
 
@@ -355,8 +485,9 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
             # for testing purpose only
             raise ValueError('Uncaught exception')
 
-        self.src_addr = self.get_client_addr()
-        if len(clients.get(self.src_addr[0], {})) >= options.maxconn:
+        ip, port = self.get_client_addr()
+        workers = clients.get(ip, {})
+        if workers and len(workers) >= options.maxconn:
             raise tornado.web.HTTPError(403, 'Too many live connections.')
 
         self.check_origin()
@@ -374,7 +505,9 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
             logging.error(traceback.format_exc())
             self.result.update(status=str(exc))
         else:
-            workers = clients.setdefault(worker.src_addr[0], {})
+            if not workers:
+                clients[ip] = workers
+            worker.src_addr = (ip, port)
             workers[worker.id] = worker
             self.loop.call_later(DELAY, recycle_worker, worker)
             self.result.update(id=worker.id, encoding=worker.encoding)
@@ -436,15 +569,9 @@ class WsockHandler(MixinHandler, tornado.websocket.WebSocketHandler):
             worker.on_write()
 
     def on_close(self):
-        if self.close_reason:
-            logging.info(
-                'Disconnecting to {}:{} with reason: {reason}'.format(
-                    *self.src_addr, reason=self.close_reason
-                )
-            )
-        else:
+        logging.info('Disconnected from {}:{}'.format(*self.src_addr))
+        if not self.close_reason:
             self.close_reason = 'client disconnected'
-            logging.info('Disconnected from {}:{}'.format(*self.src_addr))
 
         worker = self.worker_ref() if self.worker_ref else None
         if worker:

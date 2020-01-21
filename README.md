@@ -6,22 +6,23 @@
 ![PyPI](https://img.shields.io/pypi/v/webssh.svg)
 
 
-## Introduction
+### Introduction
 
 A simple web application to be used as an ssh client to connect to your ssh servers. It is written in Python, base on tornado, paramiko and xterm.js.
 
-## Features
+### Features
 
 * SSH password authentication supported, including empty password.
 * SSH public-key authentication supported, including DSA RSA ECDSA Ed25519 keys.
 * Encrypted keys supported.
+* Two-Factor Authentication (time-based one-time password) supported.
 * Fullscreen terminal supported.
 * Terminal window resizable.
 * Auto detect the ssh server's default encoding.
 * Modern browsers including Chrome, Firefox, Safari, Edge, Opera supported.
 
 
-## Preview
+### Preview
 
 ![Login](https://github.com/huashengdun/webssh/raw/master/preview/login.png)
 ![Terminal](https://github.com/huashengdun/webssh/raw/master/preview/terminal.png)
@@ -73,7 +74,7 @@ wssh --help
 
 ```javascript
 // connect to your ssh server
-wssh.connect(hostname, port, username, password, privatekey);
+wssh.connect(hostname, port, username, password, privatekey, passphrase, totp);
 
 // pass an object to wssh.connect
 var opts = {
@@ -81,7 +82,9 @@ var opts = {
   port: 'port',
   username: 'username',
   password: 'password',
-  privatekey: 'the private key text'
+  privatekey: 'the private key text',
+  passphrase: 'passphrase',
+  totp: 'totp'
 };
 wssh.connect(opts);
 
@@ -98,7 +101,74 @@ wssh.reset_encoding();
 wssh.send('ls -l');
 ```
 
+### Custom Font
+
+Custom font family usage example:
+```html
+<style>
+  @font-face {
+    font-family: 'font-name';
+    src: url('static/css/fonts/your-favorite-font');
+  }
+
+  body {
+    font-family: 'font-name';
+  }
+</style>
+```
+
+### URL Arguments
+
+Support passing arguments by url (query or fragment) like following examples:
+
+Passing form data (password must be encoded in base64, privatekey not supported)
+```bash
+http://localhost:8888/?hostname=xx&username=yy&password=str_base64_encoded
+```
+
+Passing a terminal background color
+```bash
+http://localhost:8888/#bgcolor=green
+```
+
+Passing a user defined title
+```bash
+http://localhost:8888/?title=my-ssh-server
+```
+
+Passing an encoding
+```bash
+http://localhost:8888/#encoding=gbk
+```
+
+Passing a command executed right after login
+```bash
+http://localhost:8888/?command=pwd
+```
+
+Passing a terminal type
+```bash
+http://localhost:8888/?term=xterm-256color
+```
+
+### Use Docker
+
+Start up the app
+```
+docker-compose up
+```
+
+Tear down the app
+```
+docker-compose down
+```
+
 ### Tests
+
+Requirements
+```
+pip install pytest pytest-cov codecov flake8 mock
+```
 
 Use unittest to run all tests
 ```
@@ -137,7 +207,7 @@ wssh --port=8080 --sslport=4433 --certfile='cert.crt' --keyfile='cert.key' --xhe
 ```
 
 
-## Tips
+### Tips
 
 * For whatever deployment choice you choose, don't forget to enable SSL.
 * By default plain http requests from a public network will be either redirected or blocked and being redirected takes precedence over being blocked.

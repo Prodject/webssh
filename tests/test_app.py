@@ -7,7 +7,7 @@ import tornado.gen
 from tornado.testing import AsyncHTTPTestCase
 from tornado.httpclient import HTTPError
 from tornado.options import options
-from tests.sshserver import run_ssh_server, banner
+from tests.sshserver import run_ssh_server, banner, Server
 from tests.utils import encode_multipart_formdata, read_file, make_tests_data_path  # noqa
 from webssh import handler
 from webssh.main import make_app, make_handlers
@@ -25,6 +25,7 @@ except ImportError:
 
 handler.DELAY = 0.1
 swallow_http_errors = handler.swallow_http_errors
+server_encodings = {e.strip() for e in Server.encodings}
 
 
 class TestAppBase(AsyncHTTPTestCase):
@@ -40,12 +41,12 @@ class TestAppBase(AsyncHTTPTestCase):
             self.assertEqual(response.code, 400)
             self.assertIn(b'Bad Request', response.body)
 
-    def assert_status_in(self, data, status):
+    def assert_status_in(self, status, data):
         self.assertIsNone(data['encoding'])
         self.assertIsNone(data['id'])
         self.assertIn(status, data['status'])
 
-    def assert_status_equal(self, data, status):
+    def assert_status_equal(self, status, data):
         self.assertIsNone(data['encoding'])
         self.assertIsNone(data['id'])
         self.assertEqual(status, data['status'])
@@ -172,7 +173,7 @@ class TestAppBasic(TestAppBase):
 
     def test_app_with_wrong_credentials(self):
         response = self.sync_post('/', self.body + 's')
-        self.assert_status_in(json.loads(to_str(response.body)), 'Authentication failed.') # noqa
+        self.assert_status_in('Authentication failed.', json.loads(to_str(response.body))) # noqa
 
     def test_app_with_correct_credentials(self):
         response = self.sync_post('/', self.body)
@@ -208,6 +209,23 @@ class TestAppBasic(TestAppBase):
         msg = yield ws.read_message()
         self.assertIsNone(msg)
         self.assertEqual(ws.close_reason, 'Websocket authentication failed.')
+
+    @tornado.testing.gen_test
+    def test_app_with_correct_credentials_but_ip_not_matched(self):
+        url = self.get_url('/')
+        response = yield self.async_post(url, self.body)
+        data = json.loads(to_str(response.body))
+        self.assert_status_none(data)
+
+        clients = handler.clients
+        handler.clients = {}
+        url = url.replace('http', 'ws')
+        ws_url = url + 'ws?id=' + data['id']
+        ws = yield tornado.websocket.websocket_connect(ws_url)
+        msg = yield ws.read_message()
+        self.assertIsNone(msg)
+        self.assertEqual(ws.close_reason, 'Websocket authentication failed.')
+        handler.clients = clients
 
     @tornado.testing.gen_test
     def test_app_with_correct_credentials_user_robey(self):
@@ -358,7 +376,7 @@ class TestAppBasic(TestAppBase):
 
         if swallow_http_errors:
             response = yield self.async_post(url, body, headers=headers)
-            self.assertIn(b'Invalid private key', response.body)
+            self.assertIn(b'Invalid key', response.body)
         else:
             with self.assertRaises(HTTPError) as ctx:
                 yield self.async_post(url, body, headers=headers)
@@ -367,7 +385,7 @@ class TestAppBasic(TestAppBase):
     @tornado.testing.gen_test
     def test_app_auth_with_pubkey_exceeds_key_max_size(self):
         url = self.get_url('/')
-        privatekey = 'h' * (handler.KEY_MAX_SIZE * 2)
+        privatekey = 'h' * (handler.PrivateKey.max_length + 1)
         files = [('privatekey', 'user_rsa_key', privatekey)]
         content_type, body = encode_multipart_formdata(self.body_dict.items(),
                                                        files)
@@ -376,7 +394,7 @@ class TestAppBasic(TestAppBase):
         }
         if swallow_http_errors:
             response = yield self.async_post(url, body, headers=headers)
-            self.assertIn(b'Invalid private key', response.body)
+            self.assertIn(b'Invalid key', response.body)
         else:
             with self.assertRaises(HTTPError) as ctx:
                 yield self.async_post(url, body, headers=headers)
@@ -425,7 +443,66 @@ class TestAppBasic(TestAppBase):
         self.body_dict.update(username='keyonly', password='foo')
         response = yield self.async_post('/', self.body_dict)
         self.assertEqual(response.code, 200)
-        self.assert_status_in(json.loads(to_str(response.body)), 'Bad authentication type') # noqa
+        self.assert_status_in('Bad authentication type', json.loads(to_str(response.body))) # noqa
+
+    @tornado.testing.gen_test
+    def test_app_with_user_pass2fa_with_correct_passwords(self):
+        self.body_dict.update(username='pass2fa', password='password',
+                              totp='passcode')
+        response = yield self.async_post('/', self.body_dict)
+        self.assertEqual(response.code, 200)
+        data = json.loads(to_str(response.body))
+        self.assert_status_none(data)
+
+    @tornado.testing.gen_test
+    def test_app_with_user_pass2fa_with_wrong_pkey_correct_passwords(self):
+        url = self.get_url('/')
+        privatekey = read_file(make_tests_data_path('user_rsa_key'))
+        self.body_dict.update(username='pass2fa', password='password',
+                              privatekey=privatekey, totp='passcode')
+        response = yield self.async_post(url, self.body_dict)
+        data = json.loads(to_str(response.body))
+        self.assert_status_none(data)
+
+    @tornado.testing.gen_test
+    def test_app_with_user_pkey2fa_with_correct_passwords(self):
+        url = self.get_url('/')
+        privatekey = read_file(make_tests_data_path('user_rsa_key'))
+        self.body_dict.update(username='pkey2fa', password='password',
+                              privatekey=privatekey, totp='passcode')
+        response = yield self.async_post(url, self.body_dict)
+        data = json.loads(to_str(response.body))
+        self.assert_status_none(data)
+
+    @tornado.testing.gen_test
+    def test_app_with_user_pkey2fa_with_wrong_password(self):
+        url = self.get_url('/')
+        privatekey = read_file(make_tests_data_path('user_rsa_key'))
+        self.body_dict.update(username='pkey2fa', password='wrongpassword',
+                              privatekey=privatekey, totp='passcode')
+        response = yield self.async_post(url, self.body_dict)
+        data = json.loads(to_str(response.body))
+        self.assert_status_in('Authentication failed', data)
+
+    @tornado.testing.gen_test
+    def test_app_with_user_pkey2fa_with_wrong_passcode(self):
+        url = self.get_url('/')
+        privatekey = read_file(make_tests_data_path('user_rsa_key'))
+        self.body_dict.update(username='pkey2fa', password='password',
+                              privatekey=privatekey, totp='wrongpasscode')
+        response = yield self.async_post(url, self.body_dict)
+        data = json.loads(to_str(response.body))
+        self.assert_status_in('Authentication failed', data)
+
+    @tornado.testing.gen_test
+    def test_app_with_user_pkey2fa_with_empty_passcode(self):
+        url = self.get_url('/')
+        privatekey = read_file(make_tests_data_path('user_rsa_key'))
+        self.body_dict.update(username='pkey2fa', password='password',
+                              privatekey=privatekey, totp='')
+        response = yield self.async_post(url, self.body_dict)
+        data = json.loads(to_str(response.body))
+        self.assert_status_in('Need a verification code', data)
 
 
 class OtherTestBase(TestAppBase):
@@ -439,6 +516,7 @@ class OtherTestBase(TestAppBase):
     tdstream = ''
     maxconn = 20
     origin = 'same'
+    encodings = []
     body = {
         'hostname': '127.0.0.1',
         'port': '',
@@ -467,7 +545,8 @@ class OtherTestBase(TestAppBase):
         OtherTestBase.sshserver_port += 1
 
         t = threading.Thread(
-            target=run_ssh_server, args=(self.sshserver_port, self.running)
+            target=run_ssh_server,
+            args=(self.sshserver_port, self.running, self.encodings)
         )
         t.setDaemon(True)
         t.start()
@@ -663,13 +742,13 @@ class TestAppWithCrossOriginOperation(OtherTestBase):
     def test_app_with_wrong_event_origin(self):
         body = dict(self.body, _origin='localhost')
         response = yield self.async_post('/', body)
-        self.assert_status_equal(json.loads(to_str(response.body)), 'Cross origin operation is not allowed.') # noqa
+        self.assert_status_equal('Cross origin operation is not allowed.', json.loads(to_str(response.body))) # noqa
 
     @tornado.testing.gen_test
     def test_app_with_wrong_header_origin(self):
         headers = dict(Origin='localhost')
         response = yield self.async_post('/', self.body, headers=headers)
-        self.assert_status_equal(json.loads(to_str(response.body)), 'Cross origin operation is not allowed.') # noqa
+        self.assert_status_equal('Cross origin operation is not allowed.', json.loads(to_str(response.body)), ) # noqa
 
     @tornado.testing.gen_test
     def test_app_with_correct_event_origin(self):
@@ -686,3 +765,28 @@ class TestAppWithCrossOriginOperation(OtherTestBase):
         self.assertEqual(
             response.headers.get('Access-Control-Allow-Origin'), self.origin
         )
+
+
+class TestAppWithBadEncoding(OtherTestBase):
+
+    encodings = [u'\u7f16\u7801']
+
+    @tornado.testing.gen_test
+    def test_app_with_a_bad_encoding(self):
+        response = yield self.async_post('/', self.body)
+        dic = json.loads(to_str(response.body))
+        self.assert_status_none(dic)
+        self.assertIn(dic['encoding'], server_encodings)
+
+
+class TestAppWithUnknownEncoding(OtherTestBase):
+
+    encodings = [u'\u7f16\u7801', u'UnknownEncoding']
+
+    @tornado.testing.gen_test
+    def test_app_with_a_unknown_encoding(self):
+        response = yield self.async_post('/', self.body)
+        self.assert_status_none(json.loads(to_str(response.body)))
+        dic = json.loads(to_str(response.body))
+        self.assert_status_none(dic)
+        self.assertEqual(dic['encoding'], 'utf-8')

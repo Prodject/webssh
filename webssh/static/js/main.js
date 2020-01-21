@@ -37,12 +37,17 @@ var wssh = {};
 
 jQuery(function($){
   var status = $('#status'),
-      btn = $('.btn-primary'),
+      button = $('.btn-primary'),
+      form_container = $('.form-container'),
+      waiter = $('#waiter'),
+      term_type = $('#term'),
       style = {},
-      title_text = 'WebSSH',
+      default_title = 'WebSSH',
       title_element = document.querySelector('title'),
       form_id = '#connect',
       debug = document.querySelector(form_id).noValidate,
+      custom_font = document.fonts ? document.fonts.values().next().value : undefined,
+      default_fonts,
       DISCONNECTED = 0,
       CONNECTING = 1,
       CONNECTED = 2,
@@ -50,6 +55,11 @@ jQuery(function($){
       messages = {1: 'This client is connecting ...', 2: 'This client is already connnected.'},
       key_max_size = 16384,
       fields = ['hostname', 'port', 'username'],
+      form_keys = fields.concat(['password', 'totp']),
+      opts_keys = ['bgcolor', 'title', 'encoding', 'command', 'term'],
+      url_form_data = {},
+      url_opts_data = {},
+      validated_form_data,
       event_origin,
       hostname_tester = /((^\s*((([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]))\s*$)|(^\s*((([0-9A-Fa-f]{1,4}:){7}([0-9A-Fa-f]{1,4}|:))|(([0-9A-Fa-f]{1,4}:){6}(:[0-9A-Fa-f]{1,4}|((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){5}(((:[0-9A-Fa-f]{1,4}){1,2})|:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){4}(((:[0-9A-Fa-f]{1,4}){1,3})|((:[0-9A-Fa-f]{1,4})?:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){3}(((:[0-9A-Fa-f]{1,4}){1,4})|((:[0-9A-Fa-f]{1,4}){0,2}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){2}(((:[0-9A-Fa-f]{1,4}){1,5})|((:[0-9A-Fa-f]{1,4}){0,3}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){1}(((:[0-9A-Fa-f]{1,4}){1,6})|((:[0-9A-Fa-f]{1,4}){0,4}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(:(((:[0-9A-Fa-f]{1,4}){1,7})|((:[0-9A-Fa-f]{1,4}){0,5}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:)))(%.+)?\s*$))|(^\s*((?=.{1,255}$)(?=.*[A-Za-z].*)[0-9A-Za-z](?:(?:[0-9A-Za-z]|\b-){0,61}[0-9A-Za-z])?(?:\.[0-9A-Za-z](?:(?:[0-9A-Za-z]|\b-){0,61}[0-9A-Za-z])?)*)\s*$)/;
 
@@ -66,6 +76,7 @@ jQuery(function($){
     }
   }
 
+
   function restore_items(names) {
     var i, name, value;
 
@@ -78,7 +89,64 @@ jQuery(function($){
     }
   }
 
-  restore_items(fields);
+
+  function populate_form(data) {
+    var names = form_keys.concat(['passphrase']),
+        i, name;
+
+    for (i=0; i < names.length; i++) {
+      name = names[i];
+      $('#'+name).val(data.get(name));
+    }
+  }
+
+
+  function get_object_length(object) {
+    return Object.keys(object).length;
+  }
+
+
+  function decode_uri(uri) {
+    try {
+      return decodeURI(uri);
+    } catch(e) {
+      console.error(e);
+    }
+    return '';
+  }
+
+
+  function decode_password(encoded) {
+    try {
+      return window.atob(encoded);
+    } catch (e) {
+       console.error(e);
+    }
+    return null;
+  }
+
+
+  function parse_url_data(string, form_keys, opts_keys, form_map, opts_map) {
+    var i, pair, key, val,
+        arr = string.split('&');
+
+    for (i = 0; i < arr.length; i++) {
+      pair = arr[i].split('=');
+      key = pair[0].trim().toLowerCase();
+      val = pair.slice(1).join('=').trim();
+
+      if (form_keys.indexOf(key) >= 0) {
+        form_map[key] = val;
+      } else if (opts_keys.indexOf(key) >=0) {
+        opts_map[key] = val;
+      }
+    }
+
+    if (form_map.password) {
+      form_map.password = decode_password(form_map.password);
+    }
+  }
+
 
   function parse_xterm_style() {
     var text = $('.xterm-helpers style').text();
@@ -90,14 +158,16 @@ jQuery(function($){
 
 
   function get_cell_size(term) {
-    style.width = term._core.renderer.dimensions.actualCellWidth;
-    style.height = term._core.renderer.dimensions.actualCellHeight;
+    style.width = term._core._renderService._renderer.dimensions.actualCellWidth;
+    style.height = term._core._renderService._renderer.dimensions.actualCellHeight;
   }
 
+
   function toggle_fullscreen(term) {
-    var func = term.toggleFullScreen || term.toggleFullscreen;
-    func.call(term, true);
+    $('#terminal .terminal').toggleClass('fullscreen');
+    term.fitAddon.fit();
   }
+
 
   function current_geometry(term) {
     if (!style.width || !style.height) {
@@ -111,6 +181,66 @@ jQuery(function($){
     var cols = parseInt(window.innerWidth / style.width, 10) - 1;
     var rows = parseInt(window.innerHeight / style.height, 10);
     return {'cols': cols, 'rows': rows};
+  }
+
+
+  function resize_terminal(term) {
+    var geometry = current_geometry(term);
+    term.on_resize(geometry.cols, geometry.rows);
+  }
+
+
+  function set_backgound_color(term, color) {
+    term.setOption('theme', {
+      background: color
+    });
+  }
+
+
+  function custom_font_is_loaded() {
+    if (!custom_font) {
+      console.log('No custom font specified.');
+    } else {
+      console.log('Status of custom font ' + custom_font.family + ': ' + custom_font.status);
+      if (custom_font.status === 'loaded') {
+        return true;
+      }
+      if (custom_font.status === 'unloaded') {
+        return false;
+      }
+    }
+  }
+
+  function update_font_family(term) {
+    if (term.font_family_updated) {
+      console.log('Already using custom font family');
+      return;
+    }
+
+    if (!default_fonts) {
+      default_fonts = term.getOption('fontFamily');
+    }
+
+    if (custom_font_is_loaded()) {
+      var new_fonts =  custom_font.family + ', ' + default_fonts;
+      term.setOption('fontFamily', new_fonts);
+      term.font_family_updated = true;
+      console.log('Using custom font family ' + new_fonts);
+    }
+  }
+
+
+  function reset_font_family(term) {
+    if (!term.font_family_updated) {
+      console.log('Already using default font family');
+      return;
+    }
+
+    if (default_fonts) {
+      term.setOption('fontFamily',  default_fonts);
+      term.font_family_updated = false;
+      console.log('Using default font family ' + default_fonts);
+    }
   }
 
 
@@ -188,29 +318,42 @@ jQuery(function($){
   }
 
 
-  function log_status(text) {
-    status.text(text);
+  function log_status(text, to_populate) {
     console.log(text);
+    status.html(text.split('\n').join('<br/>'));
+
+    if (to_populate && validated_form_data) {
+      populate_form(validated_form_data);
+      validated_form_data = undefined;
+    }
+
+    if (waiter.css('display') !== 'none') {
+      waiter.hide();
+    }
+
+    if (form_container.css('display') === 'none') {
+      form_container.show();
+    }
   }
 
 
   function ajax_complete_callback(resp) {
-    btn.prop('disabled', false);
+    button.prop('disabled', false);
 
     if (resp.status !== 200) {
-      log_status(resp.status + ': ' + resp.statusText);
+      log_status(resp.status + ': ' + resp.statusText, true);
       state = DISCONNECTED;
       return;
     }
 
     var msg = resp.responseJSON;
     if (!msg.id) {
-      log_status(msg.status);
+      log_status(msg.status, true);
       state = DISCONNECTED;
       return;
     }
 
-    var ws_url = window.location.href.replace('http', 'ws'),
+    var ws_url = window.location.href.split(/\?|#/, 1)[0].replace('http', 'ws'),
         join = (ws_url[ws_url.length-1] === '/' ? '' : '/'),
         url = ws_url + join + 'ws?id=' + msg.id,
         sock = new window.WebSocket(url),
@@ -219,7 +362,13 @@ jQuery(function($){
         terminal = document.getElementById('terminal'),
         term = new window.Terminal({
           cursorBlink: true,
+          theme: {
+            background: url_opts_data.bgcolor || 'black'
+          }
         });
+
+    term.fitAddon = new window.FitAddon.FitAddon();
+    term.loadAddon(term.fitAddon);
 
     console.log(url);
     if (!msg.encoding) {
@@ -227,11 +376,6 @@ jQuery(function($){
       msg.encoding = encoding;
     } else {
       console.log('The deault encoding of your server is ' + msg.encoding);
-    }
-
-    function resize_terminal(term) {
-      var geometry = current_geometry(term);
-      term.on_resize(geometry.cols, geometry.rows);
     }
 
     function term_write(text) {
@@ -262,12 +406,20 @@ jQuery(function($){
           console.log('Set encoding to ' + encoding);
         } catch (RangeError) {
           console.log('Unknown encoding ' + new_encoding);
+          return false;
         }
       }
     }
 
     wssh.set_encoding = set_encoding;
-    set_encoding(msg.encoding);
+
+    if (url_opts_data.encoding) {
+      if (set_encoding(url_opts_data.encoding) === false) {
+        set_encoding(msg.encoding);
+      }
+    } else {
+      set_encoding(msg.encoding);
+    }
 
 
     wssh.geometry = function() {
@@ -329,6 +481,18 @@ jQuery(function($){
       }
     };
 
+    wssh.set_bgcolor = function(color) {
+      set_backgound_color(term, color);
+    };
+
+    wssh.custom_font = function() {
+      update_font_family(term);
+    };
+
+    wssh.default_font = function() {
+      reset_font_family(term);
+    };
+
     term.on_resize = function(cols, rows) {
       if (cols !== this.cols || rows !== this.rows) {
         console.log('Resizing terminal to geometry: ' + format_geometry(cols, rows));
@@ -337,7 +501,7 @@ jQuery(function($){
       }
     };
 
-    term.on('data', function(data) {
+    term.onData(function(data) {
       // console.log(data);
       sock.send(JSON.stringify({'data': data}));
     });
@@ -345,9 +509,15 @@ jQuery(function($){
     sock.onopen = function() {
       term.open(terminal);
       toggle_fullscreen(term);
+      update_font_family(term);
       term.focus();
       state = CONNECTED;
-      title_element.text = title_text;
+      title_element.text = url_opts_data.title || default_title;
+      if (url_opts_data.command) {
+        setTimeout(function () {
+          sock.send(JSON.stringify({'data': url_opts_data.command+'\r'}));
+        }, 500);
+      }
     };
 
     sock.onmessage = function(msg) {
@@ -359,15 +529,14 @@ jQuery(function($){
     };
 
     sock.onclose = function(e) {
-      console.log(e);
-      term.destroy();
+      term.dispose();
       term = undefined;
       sock = undefined;
       reset_wssh();
-      status.text(e.reason);
+      log_status(e.reason, true);
       state = DISCONNECTED;
-      title_text = 'WebSSH';
-      title_element.text = title_text;
+      default_title = 'WebSSH';
+      title_element.text = default_title;
     };
 
     $(window).resize(function(){
@@ -393,9 +562,9 @@ jQuery(function($){
   }
 
 
-  function normalize_data(data) {
+  function clean_data(data) {
     var i, attr, val;
-    var attrs = fields.concat('privatekey');
+    var attrs = form_keys.concat(['privatekey', 'passphrase']);
 
     for (i = 0; i < attrs.length; i++) {
       attr = attrs[i];
@@ -408,44 +577,56 @@ jQuery(function($){
 
 
   function validate_form_data(data) {
-    normalize_data(data);
+    clean_data(data);
 
     var hostname = data.get('hostname'),
         port = data.get('port'),
         username = data.get('username'),
         pk = data.get('privatekey'),
-        result = {'vaiid': false},
-        msg, size;
+        result = {
+          valid: false,
+          data: data,
+          title: ''
+        },
+        errors = [], size;
 
     if (!hostname) {
-      msg = 'Need value hostname';
-    } else if (!port) {
-      port = 22;
-    } else if (!username) {
-      msg = 'Need value username';
-    } else if (!hostname_tester.test(hostname)) {
-      msg =  'Invalid hostname: ' + hostname;
-    } else if (port <= 0 || port > 65535) {
-      msg = 'Invalid port: ' + port;
+      errors.push('Value of hostname is required.');
     } else {
-      if (pk) {
-        size = pk.size || pk.length;
-        if (size > key_max_size) {
-          msg = 'Invalid private key: ' + pk.name || pk;
-        }
+      if (!hostname_tester.test(hostname)) {
+         errors.push('Invalid hostname: ' + hostname);
       }
     }
 
-    if (!msg || debug) {
-      result.valid = true;
-      msg = username + '@' + hostname + ':'  + port;
+    if (!port) {
+      port = 22;
+    } else {
+      if (!(port > 0 && port < 65535)) {
+        errors.push('Invalid port: ' + port);
+      }
     }
 
-    result.msg = msg;
+    if (!username) {
+      errors.push('Value of username is required.');
+    }
+
+    if (pk) {
+      size = pk.size || pk.length;
+      if (size > key_max_size) {
+        errors.push('Invalid private key: ' + pk.name || '');
+      }
+    }
+
+    if (!errors.length || debug) {
+      result.valid = true;
+      result.title = username + '@' + hostname + ':'  + port;
+    }
+    result.errors = errors;
+
     return result;
   }
 
-
+  // Fix empty input file ajax submission error for safari 11.x
   function disable_file_inputs(inputs) {
     var i, input;
 
@@ -480,10 +661,8 @@ jQuery(function($){
     enable_file_inputs(inputs);
 
     function ajax_post() {
-      store_items(fields, data);
-
       status.text('');
-      btn.prop('disabled', true);
+      button.prop('disabled', true);
 
       $.ajax({
           url: url,
@@ -498,7 +677,7 @@ jQuery(function($){
 
     var result = validate_form_data(data);
     if (!result.valid) {
-      log_status(result.msg);
+      log_status(result.errors.join('\n'));
       return;
     }
 
@@ -514,7 +693,7 @@ jQuery(function($){
       ajax_post();
     }
 
-    return result.msg;
+    return result;
   }
 
 
@@ -526,14 +705,18 @@ jQuery(function($){
 
     var result = validate_form_data(wrap_object(data));
     if (!result.valid) {
-      console.log(result.msg);
+      log_status(result.errors.join('\n'));
       return;
     }
 
+    data.term = term_type.val();
     data._xsrf = _xsrf.value;
     if (event_origin) {
       data._origin = event_origin;
     }
+
+    status.text('');
+    button.prop('disabled', true);
 
     $.ajax({
         url: url,
@@ -542,11 +725,11 @@ jQuery(function($){
         complete: ajax_complete_callback
     });
 
-    return result.msg;
+    return result;
   }
 
 
-  function connect(hostname, port, username, password, privatekey) {
+  function connect(hostname, port, username, password, privatekey, passphrase, totp) {
     // for console use
     var result, opts;
 
@@ -564,7 +747,9 @@ jQuery(function($){
           port: port,
           username: username,
           password: password,
-          privatekey: privatekey
+          privatekey: privatekey,
+          passphrase: passphrase,
+          totp: totp
         };
       } else {
         opts = hostname;
@@ -575,7 +760,11 @@ jQuery(function($){
 
     if (result) {
       state = CONNECTING;
-      title_text = result;
+      default_title = result.title;
+      if (hostname) {
+        validated_form_data = result.data;
+      }
+      store_items(fields, result.data);
     }
   }
 
@@ -613,8 +802,38 @@ jQuery(function($){
 
   window.addEventListener('message', cross_origin_connect, false);
 
-  if (window.Terminal.applyAddon) {
-    window.Terminal.applyAddon(window.fullscreen);
+  if (document.fonts) {
+    document.fonts.ready.then(
+      function () {
+        if (custom_font_is_loaded() === false) {
+          document.body.style.fontFamily = custom_font.family;
+        }
+      }
+    );
+  }
+
+
+  parse_url_data(
+    decode_uri(window.location.search.substring(1)) + '&' + decode_uri(window.location.hash.substring(1)),
+    form_keys, opts_keys, url_form_data, url_opts_data
+  );
+  // console.log(url_form_data);
+  // console.log(url_opts_data);
+
+  if (url_opts_data.term) {
+    term_type.val(url_opts_data.term);
+  }
+
+  if (url_form_data.password === null) {
+    log_status('Password via url must be encoded in base64.');
+  } else {
+    if (get_object_length(url_form_data)) {
+      waiter.show();
+      connect(url_form_data);
+    } else {
+      restore_items(fields);
+      form_container.show();
+    }
   }
 
 });
